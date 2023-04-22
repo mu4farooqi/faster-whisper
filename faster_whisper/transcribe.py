@@ -1,10 +1,9 @@
 import itertools
 import logging
-import torch
 import os
 import zlib
 
-from typing import BinaryIO, Iterable, List, NamedTuple, Optional, Tuple, Union
+from typing import BinaryIO, Iterable, List, NamedTuple, Optional, Tuple, Union, Callable
 
 import ctranslate2
 import numpy as np
@@ -171,6 +170,7 @@ class WhisperModel:
         append_punctuations: str = "\"'.。,，!！?？:：”)]}、",
         vad_filter: bool = False,
         vad_parameters: Optional[dict] = None,
+        progress_tracking_callback: Optional[Callable[[float], None]] = None,
     ) -> Tuple[Iterable[Segment], AudioInfo]:
         """Transcribes an input file.
 
@@ -313,7 +313,7 @@ class WhisperModel:
             append_punctuations=append_punctuations,
         )
 
-        segments = self.generate_segments(features, tokenizer, options, duration, encoder_output)
+        segments = self.generate_segments(features, tokenizer, options, duration, encoder_output, progress_tracking_callback)
 
         if speech_chunks:
             segments = restore_speech_timestamps(segments, speech_chunks, sampling_rate)
@@ -333,6 +333,7 @@ class WhisperModel:
         options: TranscriptionOptions,
         audio_duration: float,
         encoder_output: Optional[ctranslate2.StorageView] = None,
+        progress_tracking_callback: Optional[Callable[[float], None]] = None,
     ) -> Iterable[Segment]:
         content_frames = features.shape[-1] - self.feature_extractor.nb_max_frames
         seek = 0
@@ -397,7 +398,7 @@ class WhisperModel:
             tokens = result.sequences_ids[0]
 
             previous_seek = seek
-            current_segments = []
+            current_segment = None
 
             single_timestamp_ending = (
                 len(tokens) >= 2
@@ -428,8 +429,8 @@ class WhisperModel:
                       start_time = (
                         time_offset + start_timestamp_position * self.time_precision
                       )
-                      text_tokens.append(sliced_tokens[1:-1])
-                      last_slice = current_slice
+                    text_tokens.append(sliced_tokens[1:-1])
+                    last_slice = current_slice
 
                 end_timestamp_position = (
                     tokens[last_slice - 1] - tokenizer.timestamp_begin
@@ -437,13 +438,11 @@ class WhisperModel:
                 end_time = min(
                   time_offset + end_timestamp_position * self.time_precision, audio_duration
                 )
-                current_segments.append(
-                    dict(
-                        seek=seek,
-                        start=start_time,
-                        end=end_time,
-                        tokens=torch.cat(text_tokens),
-                    )
+                current_segment = dict(
+                    seek=seek,
+                    start=start_time,
+                    end=end_time,
+                    tokens=np.concatenate(text_tokens)
                 )
 
                 if single_timestamp_ending:
@@ -466,13 +465,11 @@ class WhisperModel:
                     duration = last_timestamp_position * self.time_precision
 
                 duration = max(0, min(duration, audio_duration - time_offset))
-                current_segments.append(
-                    dict(
-                        seek=seek,
-                        start=time_offset,
-                        end=time_offset + duration,
-                        tokens=tokens,
-                    )
+                current_segment = dict(
+                    seek=seek,
+                    start=time_offset,
+                    end=time_offset + duration,
+                    tokens=tokens,
                 )
 
                 seek += segment_size
@@ -482,7 +479,7 @@ class WhisperModel:
 
             if options.word_timestamps:
                 self.add_word_timestamps(
-                    current_segments,
+                    current_segment,
                     tokenizer,
                     encoder_output,
                     segment_size,
@@ -490,9 +487,7 @@ class WhisperModel:
                     options.append_punctuations,
                 )
 
-                word_end_timestamps = [
-                    w["end"] for s in current_segments for w in s["words"]
-                ]
+                word_end_timestamps = [w["end"] for w in current_segment["words"]]
 
                 if not single_timestamp_ending and len(word_end_timestamps) > 0:
                     seek_shift = round(
@@ -504,27 +499,29 @@ class WhisperModel:
 
             encoder_output = None
 
-            for segment in current_segments:
-                tokens = segment["tokens"]
-                text = tokenizer.decode(tokens)
+            tokens = current_segment["tokens"]
+            text = tokenizer.decode(tokens)
 
-                if segment["start"] == segment["end"] or not text.strip():
-                    continue
+            if current_segment["start"] == current_segment["end"] or not text.strip():
+                continue
 
-                all_tokens.extend(tokens)
+            all_tokens.extend(tokens)
 
-                yield Segment(
-                    start=segment["start"],
-                    end=segment["end"],
-                    text=text,
-                    words=(
-                        [Word(**word) for word in segment["words"]]
-                        if options.word_timestamps
-                        else None
-                    ),
-                    avg_log_prob=avg_log_prob,
-                    no_speech_prob=result.no_speech_prob,
-                )
+            if progress_tracking_callback is not None:
+              progress_tracking_callback(int((min(content_frames, seek) / content_frames) * 100))
+
+            yield Segment(
+                start=current_segment["start"],
+                end=current_segment["end"],
+                text=text,
+                words=(
+                    [Word(**word) for word in current_segment["words"]]
+                    if options.word_timestamps
+                    else None
+                ),
+                avg_log_prob=avg_log_prob,
+                no_speech_prob=result.no_speech_prob,
+            )
 
     def encode(self, features: np.ndarray) -> ctranslate2.StorageView:
         # When the model is running on multiple GPUs, the encoder output should be moved
@@ -650,61 +647,53 @@ class WhisperModel:
 
     def add_word_timestamps(
         self,
-        segments: List[dict],
+        segment: dict,
         tokenizer: Tokenizer,
         encoder_output: ctranslate2.StorageView,
         num_frames: int,
         prepend_punctuations: str,
         append_punctuations: str,
     ):
-        if len(segments) == 0:
-            return
+        if segment is None: return
 
-        text_tokens_per_segment = [
-            [token for token in segment["tokens"] if token < tokenizer.eot]
-            for segment in segments
-        ]
-
-        text_tokens = list(itertools.chain.from_iterable(text_tokens_per_segment))
+        text_tokens = [token for token in segment["tokens"] if token < tokenizer.eot]
         alignment = self.find_alignment(
             tokenizer, text_tokens, encoder_output, num_frames
         )
         merge_punctuations(alignment, prepend_punctuations, append_punctuations)
 
         time_offset = (
-            segments[0]["seek"]
+            segment["seek"]
             * self.feature_extractor.hop_length
             / self.feature_extractor.sampling_rate
         )
 
         word_index = 0
+        saved_tokens = 0
+        words = []
 
-        for segment, text_tokens in zip(segments, text_tokens_per_segment):
-            saved_tokens = 0
-            words = []
+        while word_index < len(alignment) and saved_tokens < len(text_tokens):
+            timing = alignment[word_index]
 
-            while word_index < len(alignment) and saved_tokens < len(text_tokens):
-                timing = alignment[word_index]
-
-                if timing["word"]:
-                    words.append(
-                        dict(
-                            word=timing["word"],
-                            start=round(time_offset + timing["start"], 2),
-                            end=round(time_offset + timing["end"], 2),
-                            probability=timing["probability"],
-                        )
+            if timing["word"]:
+                words.append(
+                    dict(
+                        word=timing["word"],
+                        start=round(time_offset + timing["start"], 2),
+                        end=round(time_offset + timing["end"], 2),
+                        probability=timing["probability"],
                     )
+                )
 
-                saved_tokens += len(timing["tokens"])
-                word_index += 1
+            saved_tokens += len(timing["tokens"])
+            word_index += 1
 
-            if len(words) > 0:
-                # adjust the segment-level timestamps based on the word-level timestamps
-                segment["start"] = words[0]["start"]
-                segment["end"] = words[-1]["end"]
+        if len(words) > 0:
+            # adjust the segment-level timestamps based on the word-level timestamps
+            segment["start"] = words[0]["start"]
+            segment["end"] = words[-1]["end"]
 
-            segment["words"] = words
+        segment["words"] = words
 
     def find_alignment(
         self,
