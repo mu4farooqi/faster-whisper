@@ -1,5 +1,6 @@
 import itertools
 import logging
+import torch
 import os
 import zlib
 
@@ -312,7 +313,7 @@ class WhisperModel:
             append_punctuations=append_punctuations,
         )
 
-        segments = self.generate_segments(features, tokenizer, options, encoder_output)
+        segments = self.generate_segments(features, tokenizer, options, duration, encoder_output)
 
         if speech_chunks:
             segments = restore_speech_timestamps(segments, speech_chunks, sampling_rate)
@@ -330,6 +331,7 @@ class WhisperModel:
         features: np.ndarray,
         tokenizer: Tokenizer,
         options: TranscriptionOptions,
+        audio_duration: float,
         encoder_output: Optional[ctranslate2.StorageView] = None,
     ) -> Iterable[Segment]:
         content_frames = features.shape[-1] - self.feature_extractor.nb_max_frames
@@ -416,31 +418,33 @@ class WhisperModel:
                 if single_timestamp_ending:
                     slices.append(len(tokens))
 
-                last_slice = 0
-                for current_slice in slices:
+                last_slice, text_tokens = 0, []
+                for idx, current_slice in enumerate(slices):
                     sliced_tokens = tokens[last_slice:current_slice]
-                    start_timestamp_position = (
+                    if idx == 0:
+                      start_timestamp_position = (
                         sliced_tokens[0] - tokenizer.timestamp_begin
-                    )
-                    end_timestamp_position = (
-                        sliced_tokens[-1] - tokenizer.timestamp_begin
-                    )
-                    start_time = (
+                      )
+                      start_time = (
                         time_offset + start_timestamp_position * self.time_precision
-                    )
-                    end_time = (
-                        time_offset + end_timestamp_position * self.time_precision
-                    )
+                      )
+                      text_tokens.append(sliced_tokens[1:-1])
+                      last_slice = current_slice
 
-                    current_segments.append(
-                        dict(
-                            seek=seek,
-                            start=start_time,
-                            end=end_time,
-                            tokens=sliced_tokens,
-                        )
+                end_timestamp_position = (
+                    tokens[last_slice - 1] - tokenizer.timestamp_begin
+                )
+                end_time = min(
+                  time_offset + end_timestamp_position * self.time_precision, audio_duration
+                )
+                current_segments.append(
+                    dict(
+                        seek=seek,
+                        start=start_time,
+                        end=end_time,
+                        tokens=torch.cat(text_tokens),
                     )
-                    last_slice = current_slice
+                )
 
                 if single_timestamp_ending:
                     # single timestamp at the end means no speech after the last timestamp.
@@ -461,6 +465,7 @@ class WhisperModel:
                     last_timestamp_position = timestamps[-1] - tokenizer.timestamp_begin
                     duration = last_timestamp_position * self.time_precision
 
+                duration = max(0, min(duration, audio_duration - time_offset))
                 current_segments.append(
                     dict(
                         seek=seek,
